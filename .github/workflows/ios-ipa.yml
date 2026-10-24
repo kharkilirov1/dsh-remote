@@ -1,0 +1,171 @@
+# Builds an UNSIGNED iOS .ipa on a GitHub-hosted macOS runner.
+#
+# No Apple developer certificate is needed here: the app is built with
+# `--no-codesign` and only packaged into Payload/Runner.app + zip. The
+# resulting .ipa is NOT installable until it is signed on the iPhone with the
+# user's own certificate + provisioning profile (BuildBox 2.0, ESign, ...).
+# See docs/IOS-BUILD.md for the download, signing and install flow.
+#
+# Trigger: manual dispatch, or pushing any tag matching `v*` (release tags).
+#
+# The Flutter pin below must match: .github/workflows/android-apk.yml,
+# tools/build_ios.sh and docs/CI.md.
+
+name: iOS IPA (unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege: the job only reads the repository and uploads an artifact.
+permissions:
+  contents: read
+
+# Re-running a tag build replaces the previous run instead of racing it.
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Flutter SDK version pinned for reproducible builds (stable channel).
+  FLUTTER_VERSION: '3.47.7'
+  # Expected `flutter build ios` output directory.
+  APP_PATH: build/ios/iphoneos/Runner.app
+  # Name of the packaged (still unsigned) IPA.
+  IPA_NAME: DSH-Remote-unsigned.ipa
+  # Optional escape hatch for Xcode drift: create a repository variable named
+  # XCODE_APP (Settings -> Secrets and variables -> Actions -> Variables) with
+  # an absolute path such as /Applications/Xcode_26.3.app to pin the toolchain.
+  # Empty means "use the runner default".
+  XCODE_APP: ${{ vars.XCODE_APP }}
+
+jobs:
+  build-unsigned-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: |
+          if [ -n "${XCODE_APP}" ]; then
+            echo "Selecting Xcode: ${XCODE_APP}"
+            sudo xcode-select -s "${XCODE_APP}"
+          else
+            echo "Using runner default Xcode"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Show macOS details
+        run: |
+          sw_vers
+          uname -m
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show Flutter details
+        run: |
+          flutter --version
+          dart --version
+          # Diagnostic only: doctor warnings (Android licences, etc.) must not
+          # fail an iOS build.
+          flutter doctor -v || echo "::warning::flutter doctor reported issues (diagnostic only)"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Build iOS (release, no codesign)
+        run: flutter build ios --release --no-codesign
+
+      - name: Verify Runner.app and read app metadata
+        run: |
+          if [ ! -d "${APP_PATH}" ]; then
+            echo "::error::Expected build output missing: ${APP_PATH}"
+            echo "Contents of build/ios (if any):"
+            ls -la build/ios 2>/dev/null || echo "  (build/ios does not exist)"
+            exit 1
+          fi
+          echo "Found ${APP_PATH}"
+          ls -ld "${APP_PATH}"
+          echo
+          echo "App metadata:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "${APP_PATH}/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "${APP_PATH}/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "${APP_PATH}/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "${APP_PATH}/Info.plist"
+          echo
+          echo "Signing state (unsigned build must carry no embedded profile):"
+          if [ -e "${APP_PATH}/_CodeSignature" ] || [ -e "${APP_PATH}/embedded.mobileprovision" ]; then
+            echo "::warning::Unexpected signing artifacts found in ${APP_PATH}"
+            find "${APP_PATH}" -maxdepth 1 \( -name '_CodeSignature' -o -name 'embedded.mobileprovision' \) -print
+          else
+            echo "No _CodeSignature / embedded.mobileprovision (expected)."
+          fi
+
+      - name: Package Payload/Runner.app into an unsigned .ipa
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/ipa"
+          rm -rf "${stage}"
+          mkdir -p "${stage}/Payload"
+          cp -R "${APP_PATH}" "${stage}/Payload/Runner.app"
+
+          mkdir -p dist
+          ipa="${GITHUB_WORKSPACE}/dist/${IPA_NAME}"
+          rm -f "${ipa}"
+          # -r: recurse; -y: store symlinks as symlinks (required for
+          # Frameworks/*.framework versioned layouts).
+          ( cd "${stage}" && zip -q -r -y "${ipa}" Payload )
+
+          if [ ! -s "${ipa}" ]; then
+            echo "::error::IPA was not created: ${ipa}"
+            exit 1
+          fi
+
+          echo "IPA contents:"
+          unzip -l "${ipa}" | sed -n '1,15p'
+          echo
+          echo "IPA size:"
+          ls -lh "${ipa}"
+          echo
+          echo "IPA sha256:"
+          # Record the digest with a bare filename so `shasum -a 256 -c` works
+          # next to the downloaded file.
+          ( cd dist && shasum -a 256 "${IPA_NAME}" | tee "${IPA_NAME}.sha256" )
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Unsigned iOS IPA"
+            echo
+            echo "- Artifact: \`ios-ipa-unsigned\` (retention 7 days)"
+            echo "- File: \`${IPA_NAME}\`"
+            echo "- Size: \`$(ls -lh "dist/${IPA_NAME}" | awk '{print $5}')\`"
+            echo "- SHA256: \`$(shasum -a 256 "dist/${IPA_NAME}" | awk '{print $1}')\`"
+            echo "- App version: \`$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "${APP_PATH}/Info.plist")+$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "${APP_PATH}/Info.plist")\`"
+            echo "- Bundle id: \`$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "${APP_PATH}/Info.plist")\`"
+            echo "- Flutter: \`${FLUTTER_VERSION}\`"
+            echo
+            echo "The IPA is **unsigned**. Download, then sign it on the iPhone — see [docs/IOS-BUILD.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/IOS-BUILD.md)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-ipa-unsigned
+          path: |
+            dist/DSH-Remote-unsigned.ipa
+            dist/DSH-Remote-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 7

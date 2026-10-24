@@ -1,0 +1,115 @@
+# Builds a release Android APK on a GitHub-hosted Linux runner.
+#
+# The APK is signed by Gradle: with no android/key.properties present the
+# project falls back to the debug signing key (see android/app/build.gradle.kts),
+# which is fine for sideloading but not for Play Store uploads. See docs/CI.md
+# for how to add a real keystore through repository secrets.
+#
+# Trigger: manual dispatch, or pushing any tag matching `v*` (release tags).
+#
+# The Flutter pin below must match: .github/workflows/ios-ipa.yml,
+# tools/build_ios.sh and docs/CI.md.
+
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege: the job only reads the repository and uploads an artifact.
+permissions:
+  contents: read
+
+# Re-running a tag build replaces the previous run instead of racing it.
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Flutter SDK version pinned for reproducible builds (stable channel).
+  FLUTTER_VERSION: '3.47.7'
+  # Expected `flutter build apk --release` output.
+  APK_PATH: build/app/outputs/flutter-apk/app-release.apk
+
+jobs:
+  build-apk:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Show JDK details
+        run: |
+          java -version
+          echo "JAVA_HOME=${JAVA_HOME}"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show Flutter details
+        run: |
+          flutter --version
+          dart --version
+          # Diagnostic only.
+          flutter doctor -v || echo "::warning::flutter doctor reported issues (diagnostic only)"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+
+      - name: Verify APK
+        run: |
+          if [ ! -f "${APK_PATH}" ]; then
+            echo "::error::Expected build output missing: ${APK_PATH}"
+            echo "Contents of build/app/outputs (if any):"
+            ls -laR build/app/outputs 2>/dev/null || echo "  (build/app/outputs does not exist)"
+            exit 1
+          fi
+          echo "Found ${APK_PATH}"
+          ls -lh "${APK_PATH}"
+          # Record the digest with a bare filename so `sha256sum -c` works next
+          # to the downloaded file.
+          apk_dir="$(dirname "${APK_PATH}")"
+          apk_file="$(basename "${APK_PATH}")"
+          ( cd "${apk_dir}" && sha256sum "${apk_file}" | tee "${apk_file}.sha256" )
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Android release APK"
+            echo
+            echo "- Artifact: \`android-apk\` (retention 7 days)"
+            echo "- File: \`app-release.apk\`"
+            echo "- Size: \`$(ls -lh "${APK_PATH}" | awk '{print $5}')\`"
+            echo "- SHA256: \`$(sha256sum "${APK_PATH}" | awk '{print $1}')\`"
+            echo "- Flutter: \`${FLUTTER_VERSION}\`"
+            echo
+            echo "Signing: debug key unless \`android/key.properties\` was provided to the build (see [docs/CI.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/CI.md))."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/app-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 7
